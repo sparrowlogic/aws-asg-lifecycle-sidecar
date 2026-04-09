@@ -9,7 +9,7 @@
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <aws.sdk.version>2.31.57</aws.sdk.version>
+        <aws.sdk.version>2.42.31</aws.sdk.version>
     </properties>
 
     <dependencyManagement>
