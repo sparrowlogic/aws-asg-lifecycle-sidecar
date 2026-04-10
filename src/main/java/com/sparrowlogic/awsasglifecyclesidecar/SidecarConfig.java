@@ -14,7 +14,7 @@ public record SidecarConfig(
         String hookSuffix
 ) {
     /** Default poll interval in seconds. */
-    private static final int DEFAULT_POLL_INTERVAL = 10;
+    private static final int DEFAULT_POLL_INTERVAL = 30;
     /** Default heartbeat interval in seconds. */
     private static final int DEFAULT_HEARTBEAT_INTERVAL = 60;
     /** Default max termination wait in seconds (115 minutes). */

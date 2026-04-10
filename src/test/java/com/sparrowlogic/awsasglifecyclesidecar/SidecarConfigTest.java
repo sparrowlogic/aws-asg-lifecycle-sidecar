@@ -14,7 +14,7 @@ class SidecarConfigTest {
         final var config = SidecarConfig.fromEnv(key -> null);
 
         assertEquals("/lifecycle", config.lifecycleDir());
-        assertEquals(10, config.pollInterval());
+        assertEquals(30, config.pollInterval());
         assertEquals(60, config.heartbeatInterval());
         assertEquals(6900, config.maxTerminationWait());
         assertNull(config.hookName());
@@ -26,7 +26,7 @@ class SidecarConfigTest {
         final var config = SidecarConfig.fromEnv(key -> "  ");
 
         assertEquals("/lifecycle", config.lifecycleDir());
-        assertEquals(10, config.pollInterval());
+        assertEquals(30, config.pollInterval());
         assertEquals(60, config.heartbeatInterval());
         assertEquals(6900, config.maxTerminationWait());
         assertEquals("terminate-wait", config.hookSuffix());

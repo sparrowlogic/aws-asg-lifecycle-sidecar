@@ -22,8 +22,6 @@ public class LifecycleSidecar {
 
     private static final Logger LOG = LoggerFactory.getLogger(LifecycleSidecar.class);
     private static final int STATUS_FORBIDDEN = 403;
-    private static final int LOG_INTERVAL_SECONDS = 30;
-    private static final int STATUS_LOG_INTERVAL = 180;
     private static final long MILLIS_PER_SECOND = 1000L;
     private static final int COMPLETE_ACTION_MAX_RETRIES = 5;
     private static final int COMPLETE_ACTION_RETRY_DELAY_SECONDS = 5;
@@ -97,10 +95,8 @@ public class LifecycleSidecar {
             }
 
             checkCount++;
-            if (checkCount % STATUS_LOG_INTERVAL == 0) {
-                LOG.info("Monitoring ({} checks, state: {})", checkCount,
-                        state != null ? state : "unknown");
-            }
+            LOG.info("Monitoring (check={}, state={})", checkCount,
+                    state != null ? state : "unknown");
             this.sleepSeconds(this.config.pollInterval());
         }
     }
@@ -127,6 +123,8 @@ public class LifecycleSidecar {
                 LOG.info("terminating-complete received — app confirmed ready for termination");
                 return;
             }
+            LOG.info("Checking for terminating-complete ({}s / {}s) — not yet present",
+                    elapsed, this.config.maxTerminationWait());
             this.writeSignalFile(terminatingFile);
             if (elapsed - lastHeartbeat >= this.config.heartbeatInterval()) {
                 this.sendHeartbeat(instanceId, asgName, hookName);
@@ -134,11 +132,6 @@ public class LifecycleSidecar {
             }
             this.sleepSeconds(this.config.pollInterval());
             elapsed += this.config.pollInterval();
-
-            if (elapsed % LOG_INTERVAL_SECONDS == 0) {
-                LOG.info("Waiting for terminating-complete ({}s / {}s)",
-                        elapsed, this.config.maxTerminationWait());
-            }
         }
         LOG.warn("Max termination wait reached — proceeding with termination");
     }
@@ -317,6 +310,7 @@ public class LifecycleSidecar {
         try {
             if (!Files.exists(file)) {
                 Files.createFile(file);
+                LOG.info("Wrote signal file: {}", file);
             }
         } catch (final IOException e) {
             LOG.warn("Could not write signal file {}: {}", file, e.getMessage());

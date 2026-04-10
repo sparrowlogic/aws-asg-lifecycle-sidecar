@@ -12,23 +12,26 @@ Your app doesn't need AWS credentials, SDKs, or any awareness of Auto Scaling �
 ## Protocol
 
 ```
-┌──────────────────┐              ┌──────────────────┐
-│ asg-lifecycle    │              │ your app         │
-│ sidecar          │              │                  │
-│                  │  /lifecycle  │                  │
-│ polls ASG state  │    volume    │                  │
-│                  │              │                  │
-│ writes           │              │                  │
-│  terminating ────┼─────────────▶│ detects          │
-│                  │              │  terminating     │
-│                  │              │ finishes work    │
-│ reads            │              │                  │
-│  terminating- ◀──┼──────────────┤ writes           │
-│  complete        │              │  terminating-    │
-│                  │              │  complete        │
-│ calls AWS:       │              │                  │
-│  CONTINUE        │              │ (no AWS needed)  │
-└──────────────────┘              └──────────────────┘
+┌─────────────────────────┐                  ┌─────────────────────────┐
+│ asg-lifecycle sidecar   │                  │ your app                │
+│                         │   /lifecycle     │                         │
+│ polls ASG state every   │     shared       │                         │
+│ POLL_INTERVAL seconds   │     volume       │                         │
+│                         │                  │                         │
+│ creates file:           │                  │                         │
+│  /lifecycle/terminating ├─────────────────▶│ detects file:           │
+│                         │                  │  /lifecycle/terminating │
+│                         │                  │                         │
+│                         │                  │ finishes in-flight work │
+│                         │                  │                         │
+│ detects file:           │                  │ creates file:           │
+│  /lifecycle/terminating-│◀─────────────────┤  /lifecycle/terminating-│
+│  complete               │                  │  complete               │
+│                         │                  │                         │
+│ calls AWS:              │                  │                         │
+│  CompleteLifecycleAction│                  │ (no AWS access needed)  │
+│  result=CONTINUE        │                  │                         │
+└─────────────────────────┘                  └─────────────────────────┘
 ```
 
 1. ASG puts instance in `Terminating:Wait`
@@ -61,7 +64,9 @@ volumes:
 
 ## Your App's Side
 
-Watch for the terminating file and signal back when ready. Minimal example:
+Watch for the terminating file and signal back when ready.
+
+### Minimal Example
 
 ```bash
 # In your app's entrypoint or health loop
@@ -77,6 +82,62 @@ Or with inotifywait:
 inotifywait -e create /lifecycle/ --include 'terminating$'
 # finish work...
 touch /lifecycle/terminating-complete
+```
+
+### Graceful Drain Example
+
+For services that need to drain in-flight work (e.g., active connections, queued jobs), use a poll loop:
+
+```bash
+#!/bin/bash
+# Drain wrapper — runs alongside your app, watches for the terminating signal,
+# stops accepting new work, waits for in-flight work to finish, then signals back.
+
+LIFECYCLE_DIR="${LIFECYCLE_DIR:-/lifecycle}"
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
+DRAIN_POLL_INTERVAL="${DRAIN_POLL_INTERVAL:-5}"
+
+# Replace with your app's logic to count in-flight work
+get_active_work() {
+    # Examples:
+    #   curl -s http://localhost:8080/metrics | grep active_requests | awk '{print $2}'
+    #   psql -tAq -c "SELECT count(*) FROM jobs WHERE state = 'running'"
+    echo "0"
+}
+
+# Replace with your app's logic to stop accepting new work
+start_draining() {
+    # Examples:
+    #   curl -s -X POST http://localhost:8080/admin/drain
+    #   touch /tmp/draining  # if your app checks for this file
+    echo "drain: marking service as draining"
+}
+
+# Wait for the sidecar to signal termination
+while [ ! -f "$LIFECYCLE_DIR/terminating" ]; do
+    sleep 5
+done
+echo "drain: terminating signal detected"
+
+start_draining
+
+# Poll until in-flight work reaches 0 or timeout
+elapsed=0
+while [ "$elapsed" -lt "$DRAIN_TIMEOUT" ]; do
+    active=$(get_active_work)
+    if [ "$active" -eq 0 ]; then
+        echo "drain: no active work remaining"
+        touch "$LIFECYCLE_DIR/terminating-complete"
+        echo "drain: complete (${elapsed}s elapsed)"
+        exit 0
+    fi
+    echo "drain: $active item(s) remaining (${elapsed}s/${DRAIN_TIMEOUT}s)"
+    sleep "$DRAIN_POLL_INTERVAL"
+    elapsed=$(( elapsed + DRAIN_POLL_INTERVAL ))
+done
+
+echo "drain: timeout reached — signaling complete anyway"
+touch "$LIFECYCLE_DIR/terminating-complete"
 ```
 
 ## Networking & IMDS Hop Limit
@@ -111,7 +172,7 @@ resource "aws_launch_template" "example" {
 
 ## Prerequisites
 
-- An ASG lifecycle hook on `autoscaling:EC2_INSTANCE_TERMINATING`
+- An [ASG lifecycle hook](https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks.html) on `autoscaling:EC2_INSTANCE_TERMINATING`
 - IAM permissions on the EC2 instance role (see [Minimum IAM Policy](#minimum-iam-policy) below)
 
 ### Terraform Example — Lifecycle Hook
@@ -205,22 +266,24 @@ All configuration is via environment variables:
 |---|---|---|
 | `AWS_REGION` | auto-detected from IMDS | AWS region (falls back to `AWS_DEFAULT_REGION`) |
 | `LIFECYCLE_DIR` | `/lifecycle` | Shared volume mount path |
-| `POLL_INTERVAL` | `10` | Seconds between ASG state checks |
+| `POLL_INTERVAL` | `30` | Seconds between ASG state checks |
 | `HEARTBEAT_INTERVAL` | `60` | Seconds between lifecycle heartbeats during termination wait |
 | `MAX_TERMINATION_WAIT` | `6900` | Max seconds to wait for terminating-complete (default: 115 min) |
 | `HOOK_NAME` | `{asg-name}-terminate-wait` | Override lifecycle hook name |
 | `HOOK_SUFFIX` | `terminate-wait` | Suffix appended to ASG name for hook name |
 
+> **Note:** `HEARTBEAT_INTERVAL` must be shorter than the lifecycle hook's [`heartbeat_timeout`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_PutLifecycleHook.html#autoscaling-PutLifecycleHook-request-HeartbeatTimeout) (Terraform: `heartbeat_timeout` on `aws_autoscaling_lifecycle_hook`). If the sidecar doesn't send a heartbeat before the hook's timeout expires, AWS will apply the hook's `default_result` and terminate the instance regardless of whether your app has finished.
+
 ## How It Works
 
-1. On startup, fetches instance ID from EC2 IMDS (v2 with v1 fallback) and ASG name from instance tags
-2. Polls `describe-auto-scaling-instances` every `POLL_INTERVAL` seconds
+1. On startup, fetches instance ID from [EC2 IMDS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html) (v2 with v1 fallback) and ASG name from instance tags
+2. Polls [`DescribeAutoScalingInstances`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_DescribeAutoScalingInstances.html) every `POLL_INTERVAL` seconds
 3. When state is `Terminating:Wait`:
    - Writes `$LIFECYCLE_DIR/terminating`
-   - Sends `record-lifecycle-action-heartbeat` every `HEARTBEAT_INTERVAL` seconds
+   - Sends [`RecordLifecycleActionHeartbeat`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_RecordLifecycleActionHeartbeat.html) every `HEARTBEAT_INTERVAL` seconds
    - Waits for `$LIFECYCLE_DIR/terminating-complete` (up to `MAX_TERMINATION_WAIT`)
    - Re-asserts the `terminating` file each poll cycle (resilient to external removal)
-   - Calls `complete-lifecycle-action` with result `CONTINUE` (retries up to 5 times on transient failures)
+   - Calls [`CompleteLifecycleAction`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_CompleteLifecycleAction.html) with result `CONTINUE` (retries up to 5 times on transient failures)
 4. If `MAX_TERMINATION_WAIT` is exceeded, proceeds with termination anyway
 5. If the hook's `heartbeat_timeout` expires before completion, AWS uses `default_result` (CONTINUE)
 
