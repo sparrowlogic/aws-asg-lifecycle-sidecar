@@ -205,10 +205,11 @@ Attach this to the EC2 instance role. Scope the ASG resource ARN to your specifi
       "Resource": "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/YOUR-ASG-NAME"
     },
     {
-      "Sid": "DescribeInstances",
+      "Sid": "DescribeAutoScaling",
       "Effect": "Allow",
       "Action": [
-        "autoscaling:DescribeAutoScalingInstances"
+        "autoscaling:DescribeAutoScalingInstances",
+        "autoscaling:DescribeLifecycleHooks"
       ],
       "Resource": "*"
     },
@@ -223,6 +224,11 @@ Attach this to the EC2 instance role. Scope the ASG resource ARN to your specifi
   ]
 }
 ```
+
+> **`autoscaling:DescribeLifecycleHooks` is recommended, not strictly required.** Without it the sidecar
+> cannot read the hook's real name and falls back to deriving one from the ASG name, which is only a
+> guess — see [Hook Name Resolution](#hook-name-resolution). `Describe*` on Auto Scaling does not support
+> resource-level scoping, so it must be `"Resource": "*"`.
 
 ### Terraform Example — IAM Policy
 
@@ -242,9 +248,12 @@ resource "aws_iam_policy" "asg_lifecycle" {
         Resource = aws_autoscaling_group.asg.arn
       },
       {
-        Sid      = "DescribeInstances"
+        Sid      = "DescribeAutoScaling"
         Effect   = "Allow"
-        Action   = ["autoscaling:DescribeAutoScalingInstances"]
+        Action   = [
+          "autoscaling:DescribeAutoScalingInstances",
+          "autoscaling:DescribeLifecycleHooks"
+        ]
         Resource = "*"
       },
       {
@@ -269,10 +278,54 @@ All configuration is via environment variables:
 | `POLL_INTERVAL` | `30` | Seconds between ASG state checks |
 | `HEARTBEAT_INTERVAL` | `60` | Seconds between lifecycle heartbeats during termination wait |
 | `MAX_TERMINATION_WAIT` | `6900` | Max seconds to wait for terminating-complete (default: 115 min) |
-| `HOOK_NAME` | `{asg-name}-terminate-wait` | Override lifecycle hook name |
-| `HOOK_SUFFIX` | `terminate-wait` | Suffix appended to ASG name for hook name |
+| `HOOK_NAME` | *(discovered, see below)* | Override lifecycle hook name |
+| `HOOK_SUFFIX` | `terminate-wait` | Suffix appended to ASG name when deriving a hook name |
+| `TERMINATION_SIGNALS` | `terminating-complete` | Comma-separated signal files that must **all** exist before completing |
+| `COMPLETE_ON_TIMEOUT` | `true` | On `MAX_TERMINATION_WAIT`, complete anyway (`true`) or leave it to the hook's `default_result` (`false`) |
 
 > **Note:** `HEARTBEAT_INTERVAL` must be shorter than the lifecycle hook's [`heartbeat_timeout`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_PutLifecycleHook.html#autoscaling-PutLifecycleHook-request-HeartbeatTimeout) (Terraform: `heartbeat_timeout` on `aws_autoscaling_lifecycle_hook`). If the sidecar doesn't send a heartbeat before the hook's timeout expires, AWS will apply the hook's `default_result` and terminate the instance regardless of whether your app has finished.
+
+## Hook Name Resolution
+
+The hook name is resolved in this order:
+
+1. `HOOK_NAME`, if set — used verbatim, no AWS call, no sanitising
+2. Read back from the ASG via [`DescribeLifecycleHooks`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_DescribeLifecycleHooks.html), taking the hook whose transition is `autoscaling:EC2_INSTANCE_TERMINATING`
+3. Derived as `{asg-name}-{HOOK_SUFFIX}`, **sanitised**
+
+Step 3 alone is not safe. AWS permits characters in an ASG name that it forbids in a
+`lifecycleHookName`, which is constrained to `[A-Za-z0-9\-_/]+` — a dot is the common case. An ASG
+named `com.example.svc-production` cannot have a hook named `com.example.svc-production-terminate-wait`,
+because AWS rejects that name at creation time; operators work around it by sanitising
+(Terraform: `replace(aws_autoscaling_group.asg.name, ".", "-")`). A sidecar that naively concatenates
+reconstructs a name that never existed, and `CompleteLifecycleAction` fails with a **400
+`ValidationException`** — not `AccessDenied`, so it looks like a transient error rather than a
+misconfiguration. The symptom is a drain that completes normally followed by an instance stuck in
+`Terminating:Wait` until the hook times out. Step 3 now applies the same sanitising, so the fallback
+is correct for the usual convention even without `DescribeLifecycleHooks`.
+
+If several terminating hooks exist on the ASG, the one matching the derived name wins; otherwise the
+first is used and the choice is logged.
+
+## Gating Completion on Several Signals
+
+By default the sidecar completes once `terminating-complete` appears. Set `TERMINATION_SIGNALS` to
+require more than one, when a drain has ordered steps that must *all* finish:
+
+```yaml
+environment:
+  TERMINATION_SIGNALS: terminating-complete,anycast-released
+  COMPLETE_ON_TIMEOUT: "false"
+```
+
+Every listed file must exist before `CompleteLifecycleAction` is called. This matters when a later
+step must not run until an earlier one is done — quiescing sessions before releasing a shared network
+resource, say — and terminating with that step unfinished would leak the resource.
+
+`COMPLETE_ON_TIMEOUT=false` makes the timeout strict: if `MAX_TERMINATION_WAIT` passes with signals
+still missing, the sidecar does **not** force `CONTINUE`. It leaves the hook to time out so AWS
+applies the hook's own `default_result`, which is the operator's declared intent for an unfinished
+drain. The default is `true`, preserving the original behaviour.
 
 ## How It Works
 
@@ -281,10 +334,10 @@ All configuration is via environment variables:
 3. When state is `Terminating:Wait`:
    - Writes `$LIFECYCLE_DIR/terminating`
    - Sends [`RecordLifecycleActionHeartbeat`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_RecordLifecycleActionHeartbeat.html) every `HEARTBEAT_INTERVAL` seconds
-   - Waits for `$LIFECYCLE_DIR/terminating-complete` (up to `MAX_TERMINATION_WAIT`)
+   - Waits for every file in `TERMINATION_SIGNALS` (default `terminating-complete`), up to `MAX_TERMINATION_WAIT`
    - Re-asserts the `terminating` file each poll cycle (resilient to external removal)
    - Calls [`CompleteLifecycleAction`](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_CompleteLifecycleAction.html) with result `CONTINUE` (retries up to 5 times on transient failures)
-4. If `MAX_TERMINATION_WAIT` is exceeded, proceeds with termination anyway
+4. If `MAX_TERMINATION_WAIT` is exceeded, completes anyway — unless `COMPLETE_ON_TIMEOUT=false`, in which case it completes nothing and lets the hook time out
 5. If the hook's `heartbeat_timeout` expires before completion, AWS uses `default_result` (CONTINUE)
 
 ## License

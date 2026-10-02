@@ -7,6 +7,7 @@ import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
 import software.amazon.awssdk.services.autoscaling.model.CompleteLifecycleActionRequest;
 import software.amazon.awssdk.services.autoscaling.model.DescribeAutoScalingInstancesRequest;
+import software.amazon.awssdk.services.autoscaling.model.DescribeLifecycleHooksRequest;
 import software.amazon.awssdk.services.autoscaling.model.RecordLifecycleActionHeartbeatRequest;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.DescribeTagsRequest;
@@ -14,6 +15,7 @@ import software.amazon.awssdk.services.ec2.model.Filter;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
  * Core sidecar logic: polls ASG state, manages termination protocol, and completes lifecycle actions.
@@ -25,6 +27,8 @@ public class LifecycleSidecar {
     private static final long MILLIS_PER_SECOND = 1000L;
     private static final int COMPLETE_ACTION_MAX_RETRIES = 5;
     private static final int COMPLETE_ACTION_RETRY_DELAY_SECONDS = 5;
+    private static final String TERMINATING_TRANSITION = "autoscaling:EC2_INSTANCE_TERMINATING";
+    private static final String IAM_RESOURCE_ANY = "\"Resource\": \"*\"";
     private static final String TERMINATING_FILE = "terminating";
     private static final String TERMINATING_COMPLETE_FILE = "terminating-complete";
 
@@ -67,8 +71,9 @@ public class LifecycleSidecar {
             return;
         }
 
-        final String hookName = this.config.resolveHookName(asgName);
+        final String hookName = this.resolveHookName(asgName);
         LOG.info("Started — instance={} asg={} hook={}", instanceId, asgName, hookName);
+        LOG.info("Completion requires every signal present: {}", this.config.requiredSignals());
         LOG.info("Timeouts: max_termination_wait={}s heartbeat={}s poll={}s",
                 this.config.maxTerminationWait(), this.config.heartbeatInterval(),
                 this.config.pollInterval());
@@ -87,9 +92,21 @@ public class LifecycleSidecar {
             if ("Terminating:Wait".equals(state)) {
                 LOG.info("Terminating:Wait detected — writing terminating signal");
                 this.writeSignalFile(terminatingFile);
-                this.waitForTerminatingComplete(terminatingCompleteFile, instanceId, asgName,
-                        hookName, terminatingFile);
-                this.completeAction(instanceId, asgName, hookName);
+                final boolean ready = this.waitForTerminatingComplete(terminatingCompleteFile,
+                        instanceId, asgName, hookName, terminatingFile);
+                if (ready) {
+                    this.completeAction(instanceId, asgName, hookName);
+                } else if (this.config.completeOnTimeout()) {
+                    LOG.warn("Completing anyway after timeout (COMPLETE_ON_TIMEOUT=true). "
+                            + "Set it false to leave an unfinished drain to the hook's own "
+                            + "DefaultResult instead.");
+                    this.completeAction(instanceId, asgName, hookName);
+                } else {
+                    LOG.warn("NOT completing the lifecycle action: not every required signal "
+                            + "arrived and COMPLETE_ON_TIMEOUT=false. Leaving the hook to time "
+                            + "out so AWS applies its DefaultResult, rather than this sidecar "
+                            + "forcing CONTINUE over a drain that never finished.");
+                }
                 LOG.info("Done. Exiting.");
                 return;
             }
@@ -102,29 +119,38 @@ public class LifecycleSidecar {
     }
 
     /**
-     * Waits for the terminating-complete file, sending heartbeats periodically.
+     * Waits until every required signal file is present, sending heartbeats periodically.
      *
-     * @param terminatingCompleteFile path to terminating-complete file
+     * <p>Completion is gated on ALL of TERMINATION_SIGNALS, not just the first. A drain that
+     * has several ordered steps -- quiesce sessions, then release a shared resource that must
+     * not be released while sessions are live -- needs every step confirmed before the instance
+     * is allowed to go away. Any one of them missing means the drain is unfinished.</p>
+     *
+     * @param terminatingCompleteFile path to the primary terminating-complete file
      * @param instanceId              EC2 instance ID
      * @param asgName                 ASG name
      * @param hookName                lifecycle hook name
      * @param terminatingFile         path to terminating file (re-asserted each cycle)
+     * @return true when every required signal arrived, false if the wait timed out first
      * @throws InterruptedException if interrupted while sleeping
      */
-    void waitForTerminatingComplete(final Path terminatingCompleteFile, final String instanceId,
-                                    final String asgName, final String hookName,
-                                    final Path terminatingFile)
+    boolean waitForTerminatingComplete(final Path terminatingCompleteFile, final String instanceId,
+                                       final String asgName, final String hookName,
+                                       final Path terminatingFile)
             throws InterruptedException {
+        final Path dir = terminatingCompleteFile.getParent();
         int elapsed = 0;
         int lastHeartbeat = 0;
 
         while (elapsed < this.config.maxTerminationWait()) {
-            if (Files.exists(terminatingCompleteFile)) {
-                LOG.info("terminating-complete received — app confirmed ready for termination");
-                return;
+            final var missing = this.missingSignals(dir);
+            if (missing.isEmpty()) {
+                LOG.info("All required signals received ({}) — app confirmed ready "
+                        + "for termination", this.config.requiredSignals());
+                return true;
             }
-            LOG.info("Checking for terminating-complete ({}s / {}s) — not yet present",
-                    elapsed, this.config.maxTerminationWait());
+            LOG.info("Waiting on signals {} ({}s / {}s)", missing, elapsed,
+                    this.config.maxTerminationWait());
             this.writeSignalFile(terminatingFile);
             if (elapsed - lastHeartbeat >= this.config.heartbeatInterval()) {
                 this.sendHeartbeat(instanceId, asgName, hookName);
@@ -133,8 +159,116 @@ public class LifecycleSidecar {
             this.sleepSeconds(this.config.pollInterval());
             elapsed += this.config.pollInterval();
         }
-        LOG.warn("Max termination wait reached — proceeding with termination");
+        LOG.warn("Max termination wait reached with signals still missing: {}",
+                this.missingSignals(dir));
+        return false;
     }
+
+    /**
+     * Lists the required signal files that are not yet present.
+     *
+     * @param dir lifecycle directory
+     * @return names of the signals still missing, in configured order
+     */
+    private List<String> missingSignals(final Path dir) {
+        return this.config.requiredSignals().stream()
+                .filter(name -> !Files.exists(dir.resolve(name)))
+                .toList();
+    }
+
+    /**
+     * Resolves the lifecycle hook name, preferring what AWS actually has over a guess.
+     *
+     * <p>Order: an explicit HOOK_NAME wins; otherwise the terminating hook is read back from
+     * the ASG; otherwise a sanitised name derived from the ASG name is used. Deriving alone is
+     * not safe -- an ASG name may contain characters AWS forbids in a lifecycleHookName (a dot
+     * being the usual case), so the derived value can be a name AWS will reject with a 400
+     * ValidationException. That is not retryable and not AccessDenied, so the symptom is a
+     * drain that completes normally followed by an instance stuck in Terminating:Wait until
+     * the hook times out.</p>
+     *
+     * @param asgName ASG name
+     * @return hook name to use
+     */
+    String resolveHookName(final String asgName) {
+        String resolved = this.config.hookName();
+        if (resolved == null) {
+            resolved = this.discoverHookName(asgName);
+        }
+        if (resolved == null) {
+            final String derived = this.config.resolveHookName(asgName);
+            final String raw = asgName + "-" + this.config.hookSuffix();
+            if (!raw.equals(derived)) {
+                LOG.warn("Derived hook name '{}' contains characters AWS forbids; using '{}'. "
+                        + "Set HOOK_NAME explicitly if your hook is named differently.",
+                        raw, derived);
+            }
+            resolved = derived;
+        }
+        return resolved;
+    }
+
+    /**
+     * Reads the terminating lifecycle hook's real name back from the ASG.
+     *
+     * <p>Returns null when the lookup is not possible -- most often because the instance role
+     * lacks autoscaling:DescribeLifecycleHooks, which is not fatal: the caller falls back to a
+     * derived name.</p>
+     *
+     * @param asgName ASG name
+     * @return hook name, or null if it could not be determined
+     */
+    String discoverHookName(final String asgName) {
+        String result = null;
+        try {
+            final var resp = this.asgClient.describeLifecycleHooks(
+                    DescribeLifecycleHooksRequest.builder()
+                            .autoScalingGroupName(asgName).build());
+            if (resp == null || resp.lifecycleHooks() == null) {
+                LOG.warn("describeLifecycleHooks returned nothing for {} — "
+                        + "falling back to a derived name", asgName);
+            } else {
+                result = this.pickHookName(asgName, resp.lifecycleHooks().stream()
+                        .filter(h -> TERMINATING_TRANSITION.equals(h.lifecycleTransition()))
+                        .map(h -> h.lifecycleHookName())
+                        .filter(SidecarConfig::isValidHookName)
+                        .toList());
+            }
+        } catch (final AwsServiceException e) {
+            this.logAwsError("autoscaling:DescribeLifecycleHooks", e,
+                    "autoscaling:DescribeLifecycleHooks", IAM_RESOURCE_ANY);
+        } catch (final SdkClientException e) {
+            LOG.warn("Could not describe lifecycle hooks: {}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * Chooses among the terminating hooks found on the ASG.
+     *
+     * @param asgName ASG name
+     * @param names   valid terminating hook names
+     * @return the hook to use, or null if there were none
+     */
+    private String pickHookName(final String asgName, final List<String> names) {
+        String picked = null;
+        if (names.isEmpty()) {
+            LOG.warn("No {} hook found on {} — falling back to a derived name",
+                    TERMINATING_TRANSITION, asgName);
+        } else if (names.size() > 1) {
+            // Prefer one matching what we would have derived, so a multi-hook ASG stays
+            // predictable rather than depending on API ordering.
+            final String derived = this.config.resolveHookName(asgName);
+            picked = names.contains(derived) ? derived : names.getFirst();
+            LOG.warn("ASG {} has {} terminating hooks {} — using '{}'",
+                    asgName, names.size(), names, picked);
+        } else {
+            picked = names.getFirst();
+            LOG.info("Discovered lifecycle hook '{}' on {}", picked, asgName);
+        }
+        return picked;
+    }
+
 
     /**
      * Queries the lifecycle state of the given instance.
@@ -150,7 +284,7 @@ public class LifecycleSidecar {
             return instances.isEmpty() ? null : instances.getFirst().lifecycleState();
         } catch (final AwsServiceException e) {
             this.logAwsError("autoscaling:DescribeAutoScalingInstances", e,
-                    "autoscaling:DescribeAutoScalingInstances", "\"Resource\": \"*\"");
+                    "autoscaling:DescribeAutoScalingInstances", IAM_RESOURCE_ANY);
         } catch (final SdkClientException e) {
             LOG.warn("Failed to get lifecycle state: {}", e.getMessage());
         }
@@ -174,7 +308,7 @@ public class LifecycleSidecar {
             return tags.isEmpty() ? null : tags.getFirst().value();
         } catch (final AwsServiceException e) {
             this.logAwsError("ec2:DescribeTags", e,
-                    "ec2:DescribeTags", "\"Resource\": \"*\"");
+                    "ec2:DescribeTags", IAM_RESOURCE_ANY);
         } catch (final SdkClientException e) {
             LOG.warn("Failed to get ASG name: {}", e.getMessage());
         }
